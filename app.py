@@ -222,7 +222,7 @@ with st.sidebar:
 st.info(
     f"篩選規則：排除金融類股；最新交易日成交量至少 {min_volume_lots:,.0f} 張，"
     f"且不超過前 20 個交易日平均成交量的 {volume_ratio_limit:.0f}%；"
-    f"MA5 > MA10；MA5、MA10、MA20、MA60 的最大值與最小值之差 "
+    f"均線糾結只計算 MA5、MA10、MA20：三者最大值與最小值之差 "
     f"÷ 最新收盤價 ≤ {ma_spread_limit:.1f}%。"
 )
 st.caption(
