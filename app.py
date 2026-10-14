@@ -340,7 +340,7 @@ if st.session_state.scan_results is not None:
         )
         st.caption(
             "量比 = 最新交易日成交量 ÷ 前20個交易日均量；"
-            "均線糾結幅度 = (最高均線 − 最低均線) ÷ 最新收盤價。"
+            "均線糾結幅度 = (MA5、MA10、MA20 的最高值 − 最低值) ÷ 最新收盤價。"
         )
 else:
     st.subheader("使用方式")
