@@ -152,16 +152,13 @@ def evaluate_stock(
     ma10 = float(hist["Close"].rolling(10).mean().iloc[-1])
     ma20 = float(hist["Close"].rolling(20).mean().iloc[-1])
     ma60 = float(hist["Close"].rolling(60).mean().iloc[-1])
-    mas = [ma5, ma10, ma20, ma60]
-    if any(pd.isna(value) for value in mas):
-        return None
-
-    # Requested trend condition.
-    if ma5 <= ma10:
+    # Tangle is defined using MA5, MA10 and MA20 only.
+    mas_tangle = [ma5, ma10, ma20]
+    if any(pd.isna(value) for value in [ma5, ma10, ma20, ma60]):
         return None
 
     volume_ratio_pct = volume_shares / avg20_shares * 100
-    spread_pct = (max(mas) - min(mas)) / close * 100
+    spread_pct = (max(mas_tangle) - min(mas_tangle)) / close * 100
     if volume_ratio_pct > volume_ratio_limit or spread_pct > ma_spread_limit:
         return None
 
@@ -204,10 +201,15 @@ with st.sidebar:
     )
     period_label = st.selectbox(
         "歷史資料下載範圍",
-        ["1 個月", "2 個月", "3 個月（建議）"],
+        ["1 個月", "2 個月", "3 個月（建議）", "6 個月"],
         index=2,
     )
-    period = {"1 個月": "1mo", "2 個月": "2mo", "3 個月（建議）": "3mo"}[period_label]
+    period = {
+        "1 個月": "1mo",
+        "2 個月": "2mo",
+        "3 個月（建議）": "3mo",
+        "6 個月": "6mo",
+    }[period_label]
     volume_unit = st.radio("成交量顯示單位", ["張", "股"], index=0)
     scan_choice = st.selectbox(
         "掃描數量（測試用）",
@@ -350,7 +352,6 @@ else:
         4. 確認成功後選擇「全部符合清單的股票」再按「開始掃描」。
         5. 結果可以直接查看或下載 CSV。
 
-        **固定條件：MA5 必須大於 MA10。**
         建議在台股收盤後執行；盤中最新日線可能尚未完成。
         """
     )
