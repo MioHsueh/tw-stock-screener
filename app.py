@@ -13,7 +13,7 @@ st.title("📉 台股量縮 × 均線糾結選股")
 st.caption("掃描台股上市＋上櫃｜收盤後日線篩選｜資料由公開行情來源取得，不會產生假造報價")
 
 st.info(
-    "篩選規則：最新交易日成交量 ≤ 前 20 個交易日平均成交量的 10%；"
+    "篩選規則：排除金融類股；最新交易日成交量至少 1,000 張，且不超過前 20 個交易日平均成交量的 10%；"
     "MA5、MA10、MA20、MA60 的最大值與最小值之差 ÷ 最新收盤價 ≤ 3%。"
 )
 
@@ -47,9 +47,20 @@ def get_stock_universe():
             df = df[allowed].copy()
     if "stock_name" not in df.columns:
         df["stock_name"] = ""
+    if "industry_category" not in df.columns:
+        df["industry_category"] = ""
     df["stock_name"] = df["stock_name"].fillna("").astype(str)
+    df["industry_category"] = df["industry_category"].fillna("").astype(str)
+    # Exclude financial-sector companies by industry category and name fallback.
+    category_finance = df["industry_category"].str.contains(
+        r"金融|銀行|保險|證券|期貨|票券|金控", case=False, regex=True, na=False
+    )
+    name_finance = df["stock_name"].str.contains(
+        r"金融|金控|銀行|證券|期貨|票券|產險|壽險|保險", case=False, regex=True, na=False
+    )
+    df = df[~(category_finance | name_finance)].copy()
     df = df.drop_duplicates(subset=["stock_id"], keep="last")
-    return df[["stock_id", "stock_name"]].sort_values("stock_id").reset_index(drop=True)
+    return df[["stock_id", "stock_name", "industry_category"]].sort_values("stock_id").reset_index(drop=True)
 
 
 def download_history(stock_ids, period="6mo", chunk_size=80, progress=None):
@@ -106,7 +117,7 @@ def download_history(stock_ids, period="6mo", chunk_size=80, progress=None):
     return results
 
 
-def evaluate_stock(hist, stock_name, volume_ratio_limit, ma_spread_limit, volume_unit):
+def evaluate_stock(hist, stock_name, volume_ratio_limit, ma_spread_limit, min_volume_lots, volume_unit):
     hist = hist.copy().sort_index()
     hist = hist[~hist.index.duplicated(keep="last")]
     hist["Close"] = pd.to_numeric(hist["Close"], errors="coerce")
@@ -125,6 +136,9 @@ def evaluate_stock(hist, stock_name, volume_ratio_limit, ma_spread_limit, volume
     close = float(latest["Close"])
     volume_shares = float(latest["Volume"])
     if close <= 0 or avg20 <= 0:
+        return None
+    # Yahoo Finance volume is in shares; 1 Taiwan lot = 1,000 shares.
+    if volume_shares / 1000 < min_volume_lots:
         return None
 
     ma5 = hist["Close"].rolling(5).mean().iloc[-1]
@@ -168,6 +182,11 @@ with st.sidebar:
         "均線糾結幅度上限（%）",
         min_value=0.1, max_value=20.0, value=3.0, step=0.5,
     )
+    min_volume_lots = st.number_input(
+        "最低當日成交量（張）",
+        min_value=0, max_value=1000000, value=1000, step=100,
+        help="只保留最新交易日成交量至少達到此張數的股票；1 張 = 1,000 股。",
+    )
     period_label = st.selectbox("歷史資料下載範圍", ["6 個月（建議）", "1 年"], index=0)
     period = "6mo" if period_label.startswith("6") else "1y"
     volume_unit = st.radio("成交量顯示單位", ["張", "股"], index=0)
@@ -208,7 +227,10 @@ if run_scan:
             sid = str(hist["stock_id"].iloc[0])
             ticker = str(hist["ticker"].iloc[0])
             hist = hist.drop(columns=["stock_id", "ticker"], errors="ignore")
-            row = evaluate_stock(hist, names.get(sid, ""), volume_ratio_limit, ma_spread_limit, volume_unit)
+            row = evaluate_stock(
+                hist, names.get(sid, ""), volume_ratio_limit, ma_spread_limit,
+                min_volume_lots, volume_unit
+            )
             if row:
                 row["股票代號"] = sid
                 row["行情代碼"] = ticker
@@ -243,7 +265,7 @@ if st.session_state.scan_results is not None:
     c3.metric("掃描時間", meta.get("run_time", "—"))
 
     st.caption(
-        f"股票清單共 {meta.get('universe_count', 0):,} 檔；"
+        f"股票清單（已排除金融類股）共 {meta.get('universe_count', 0):,} 檔；"
         f"資料期間：{meta.get('period', '—')}。"
         "若成功取得行情的股票數明顯少於清單數，結果可能不完整。"
     )
