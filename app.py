@@ -1,0 +1,284 @@
+import time
+from datetime import datetime
+from io import BytesIO
+
+import pandas as pd
+import requests
+import streamlit as st
+import yfinance as yf
+
+st.set_page_config(page_title="台股量縮均線糾結選股", page_icon="📉", layout="wide")
+
+st.title("📉 台股量縮 × 均線糾結選股")
+st.caption("掃描台股上市＋上櫃｜收盤後日線篩選｜資料由公開行情來源取得，不會產生假造報價")
+
+st.info(
+    "篩選規則：最新交易日成交量 ≤ 前 20 個交易日平均成交量的 10%；"
+    "MA5、MA10、MA20、MA60 的最大值與最小值之差 ÷ 最新收盤價 ≤ 3%。"
+)
+
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def get_stock_universe():
+    """Get Taiwan stock information from FinMind's public dataset."""
+    params = {"dataset": "TaiwanStockInfo"}
+    response = requests.get(FINMIND_URL, params=params, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("status") not in (200, "200", None):
+        raise RuntimeError(f"股票清單來源回應錯誤：{payload}")
+    data = payload.get("data", [])
+    df = pd.DataFrame(data)
+    if df.empty or "stock_id" not in df.columns:
+        raise RuntimeError("股票清單來源沒有回傳可用資料。")
+    # This dataset generally includes multiple instrument types. Keep four-digit
+    # stock IDs and exclude ETFs/ETNs and other non-common-share instruments by
+    # using the source's type field when available.
+    df["stock_id"] = df["stock_id"].astype(str).str.strip()
+    df = df[df["stock_id"].str.fullmatch(r"\d{4}", na=False)].copy()
+    if "type" in df.columns:
+        type_text = df["type"].astype(str).str.lower()
+        # FinMind commonly labels ordinary shares as "twse" or "tpex";
+        # allow missing/unrecognized types rather than silently dropping stocks.
+        allowed = type_text.str.contains("twse|tpex|上市|上櫃|stock", regex=True)
+        if allowed.any():
+            df = df[allowed].copy()
+    if "stock_name" not in df.columns:
+        df["stock_name"] = ""
+    df["stock_name"] = df["stock_name"].fillna("").astype(str)
+    df = df.drop_duplicates(subset=["stock_id"], keep="last")
+    return df[["stock_id", "stock_name"]].sort_values("stock_id").reset_index(drop=True)
+
+
+def download_history(stock_ids, period="6mo", chunk_size=80, progress=None):
+    """Download real daily history from Yahoo Finance in chunks."""
+    results = []
+    total_chunks = max(1, (len(stock_ids) + chunk_size - 1) // chunk_size)
+    for chunk_no, start in enumerate(range(0, len(stock_ids), chunk_size), start=1):
+        chunk = stock_ids[start:start + chunk_size]
+        tickers = [f"{sid}.TW" for sid in chunk] + [f"{sid}.TWO" for sid in chunk]
+        try:
+            data = yf.download(
+                tickers=tickers,
+                period=period,
+                interval="1d",
+                auto_adjust=False,
+                group_by="ticker",
+                progress=False,
+                threads=True,
+                timeout=25,
+            )
+        except Exception:
+            data = pd.DataFrame()
+
+        if not data.empty:
+            # yfinance returns either MultiIndex columns (multiple tickers) or
+            # simple columns (single ticker).
+            if isinstance(data.columns, pd.MultiIndex):
+                available = set(data.columns.get_level_values(0))
+                for sid in chunk:
+                    for suffix in (".TW", ".TWO"):
+                        ticker = sid + suffix
+                        if ticker not in available:
+                            continue
+                        try:
+                            one = data[ticker].copy()
+                            one = one.dropna(subset=["Close", "Volume"], how="any")
+                            if len(one) >= 60:
+                                one["stock_id"] = sid
+                                one["ticker"] = ticker
+                                results.append(one)
+                                break
+                        except Exception:
+                            continue
+            elif len(chunk) == 1:
+                one = data.dropna(subset=["Close", "Volume"], how="any")
+                if len(one) >= 60:
+                    one["stock_id"] = chunk[0]
+                    one["ticker"] = chunk[0] + ".TW"
+                    results.append(one)
+        if progress:
+            progress.progress(min(chunk_no / total_chunks, 1.0), text=f"下載行情中：第 {chunk_no}/{total_chunks} 批")
+        # Small pause to reduce request bursts and avoid provider throttling.
+        time.sleep(0.15)
+    return results
+
+
+def evaluate_stock(hist, stock_name, volume_ratio_limit, ma_spread_limit, volume_unit):
+    hist = hist.copy().sort_index()
+    hist = hist[~hist.index.duplicated(keep="last")]
+    hist["Close"] = pd.to_numeric(hist["Close"], errors="coerce")
+    hist["Volume"] = pd.to_numeric(hist["Volume"], errors="coerce")
+    hist = hist.dropna(subset=["Close", "Volume"])
+    if len(hist) < 61:
+        return None
+
+    # The latest daily bar can be today's incomplete bar while the market is open.
+    # This app is intended for after-close scanning; still display the source date.
+    latest = hist.iloc[-1]
+    previous_20 = hist["Volume"].iloc[-21:-1]
+    if len(previous_20) != 20:
+        return None
+    avg20 = previous_20.mean()
+    close = float(latest["Close"])
+    volume_shares = float(latest["Volume"])
+    if close <= 0 or avg20 <= 0:
+        return None
+
+    ma5 = hist["Close"].rolling(5).mean().iloc[-1]
+    ma10 = hist["Close"].rolling(10).mean().iloc[-1]
+    ma20 = hist["Close"].rolling(20).mean().iloc[-1]
+    ma60 = hist["Close"].rolling(60).mean().iloc[-1]
+    mas = [ma5, ma10, ma20, ma60]
+    if any(pd.isna(v) for v in mas):
+        return None
+    spread_pct = (max(mas) - min(mas)) / close * 100
+    volume_ratio_pct = volume_shares / avg20 * 100
+    if volume_ratio_pct > volume_ratio_limit or spread_pct > ma_spread_limit:
+        return None
+
+    # Yahoo Finance Taiwan volume is typically shares, while Taiwan quotes are
+    # often discussed in lots (張). Show both shares and lots to avoid ambiguity.
+    return {
+        "股票代號": str(latest.get("stock_id", "")),
+        "股票名稱": stock_name,
+        "資料日期": pd.Timestamp(hist.index[-1]).strftime("%Y-%m-%d"),
+        "收盤價": close,
+        f"成交量({volume_unit})": volume_shares / 1000 if volume_unit == "張" else volume_shares,
+        f"前20日均量({volume_unit})": avg20 / 1000 if volume_unit == "張" else avg20,
+        "量比(%)": volume_ratio_pct,
+        "MA5": float(ma5),
+        "MA10": float(ma10),
+        "MA20": float(ma20),
+        "MA60": float(ma60),
+        "均線糾結幅度(%)": spread_pct,
+    }
+
+
+with st.sidebar:
+    st.header("篩選設定")
+    volume_ratio_limit = st.number_input(
+        "成交量上限（前20日均量的 %）",
+        min_value=1.0, max_value=100.0, value=10.0, step=1.0,
+        help="設定 10 代表最新交易日成交量不得超過前 20 個交易日平均成交量的 10%。",
+    )
+    ma_spread_limit = st.number_input(
+        "均線糾結幅度上限（%）",
+        min_value=0.1, max_value=20.0, value=3.0, step=0.5,
+    )
+    period_label = st.selectbox("歷史資料下載範圍", ["6 個月（建議）", "1 年"], index=0)
+    period = "6mo" if period_label.startswith("6") else "1y"
+    volume_unit = st.radio("成交量顯示單位", ["張", "股"], index=0)
+    max_stocks = st.selectbox(
+        "掃描數量（測試用）",
+        ["全部符合清單的股票", "前 100 檔（測試）", "前 300 檔（測試）"],
+        index=0,
+        help="第一次執行可選前 100 檔測試連線；正式掃描選全部。",
+    )
+    run_scan = st.button("🔎 開始掃描", type="primary", use_container_width=True)
+
+st.caption("資料來源：FinMind 公開股票清單 + Yahoo Finance 日線歷史行情。第三方資料可能延遲、缺漏或限流；本工具不是即時報價服務。")
+
+if "scan_results" not in st.session_state:
+    st.session_state.scan_results = None
+if "scan_error" not in st.session_state:
+    st.session_state.scan_error = None
+
+if run_scan:
+    st.session_state.scan_results = None
+    st.session_state.scan_error = None
+    try:
+        with st.spinner("取得上市櫃股票清單…"):
+            universe = get_stock_universe()
+        if max_stocks == "前 100 檔（測試）":
+            universe = universe.head(100)
+        elif max_stocks == "前 300 檔（測試）":
+            universe = universe.head(300)
+
+        st.write(f"股票清單取得 {len(universe):,} 檔，開始下載日線資料。全市場掃描可能需要數分鐘，亦可能因資料來源限流而不完整。")
+        prog = st.progress(0, text="準備下載行情…")
+        ids = universe["stock_id"].tolist()
+        names = dict(zip(universe["stock_id"], universe["stock_name"]))
+        histories = download_history(ids, period=period, progress=prog)
+
+        rows = []
+        for hist in histories:
+            sid = str(hist["stock_id"].iloc[0])
+            ticker = str(hist["ticker"].iloc[0])
+            hist = hist.drop(columns=["stock_id", "ticker"], errors="ignore")
+            row = evaluate_stock(hist, names.get(sid, ""), volume_ratio_limit, ma_spread_limit, volume_unit)
+            if row:
+                row["股票代號"] = sid
+                row["行情代碼"] = ticker
+                rows.append(row)
+
+        result = pd.DataFrame(rows)
+        if not result.empty:
+            result = result.sort_values(
+                ["量比(%)", "均線糾結幅度(%)"], ascending=[True, True]
+            ).reset_index(drop=True)
+        st.session_state.scan_results = result
+        st.session_state.scan_meta = {
+            "universe_count": len(universe),
+            "history_count": len(histories),
+            "run_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "period": period_label,
+        }
+    except Exception as exc:
+        st.session_state.scan_error = str(exc)
+
+if st.session_state.scan_error:
+    st.error("掃描失敗。可能是網路、資料來源格式或請求限制造成。")
+    st.code(st.session_state.scan_error)
+    st.markdown("請稍後重試；若持續失敗，可先選「前 100 檔（測試）」確認資料連線。")
+
+if st.session_state.scan_results is not None:
+    result = st.session_state.scan_results
+    meta = st.session_state.get("scan_meta", {})
+    c1, c2, c3 = st.columns(3)
+    c1.metric("符合條件", f"{len(result):,} 檔")
+    c2.metric("成功取得歷史行情", f"{meta.get('history_count', 0):,} 檔")
+    c3.metric("掃描時間", meta.get("run_time", "—"))
+
+    st.caption(
+        f"股票清單共 {meta.get('universe_count', 0):,} 檔；"
+        f"資料期間：{meta.get('period', '—')}。"
+        "若成功取得行情的股票數明顯少於清單數，結果可能不完整。"
+    )
+    if result.empty:
+        st.warning("這次沒有找到符合條件的股票。這是實際篩選結果，不會以示意資料補上。")
+    else:
+        display = result.drop(columns=["行情代碼"], errors="ignore").copy()
+        numeric_formats = {
+            "收盤價": "{:.2f}",
+            f"成交量({volume_unit})": "{:,.0f}",
+            f"前20日均量({volume_unit})": "{:,.0f}",
+            "量比(%)": "{:.2f}%",
+            "MA5": "{:.2f}",
+            "MA10": "{:.2f}",
+            "MA20": "{:.2f}",
+            "MA60": "{:.2f}",
+            "均線糾結幅度(%)": "{:.2f}%",
+        }
+        st.dataframe(
+            display.style.format(numeric_formats, na_rep="—"),
+            use_container_width=True,
+            hide_index=True,
+        )
+        csv = display.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button("⬇️ 下載 CSV", data=csv, file_name="台股量縮均線糾結選股.csv", mime="text/csv")
+        st.caption("注意：量比 = 最新交易日成交量 ÷ 前20個交易日均量；均線糾結幅度 = (最高均線 − 最低均線) ÷ 最新收盤價。")
+else:
+    st.subheader("使用方式")
+    st.markdown(
+        """
+        1. 在左側確認條件（預設已設定為量比 10%、均線糾結 3%）。
+        2. 第一次建議選「前 100 檔（測試）」確認資料連線。
+        3. 測試成功後，選「全部符合清單的股票」再按「開始掃描」。
+        4. 結果可直接查看，也可下載成 CSV。
+
+        **請在台股收盤後執行。** 若在盤中執行，最新一根日線可能尚未完成，成交量與均線結果會隨行情更新。
+        """
+    )
