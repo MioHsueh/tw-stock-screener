@@ -148,6 +148,11 @@ def evaluate_stock(hist, stock_name, volume_ratio_limit, ma_spread_limit, min_vo
     mas = [ma5, ma10, ma20, ma60]
     if any(pd.isna(v) for v in mas):
         return None
+
+    # Additional trend condition requested: 5-day moving average above 10-day MA.
+    if float(ma5) <= float(ma10):
+        return None
+
     spread_pct = (max(mas) - min(mas)) / close * 100
     volume_ratio_pct = volume_shares / avg20 * 100
     if volume_ratio_pct > volume_ratio_limit or spread_pct > ma_spread_limit:
@@ -187,8 +192,9 @@ with st.sidebar:
         min_value=0, max_value=1000000, value=1000, step=100,
         help="只保留最新交易日成交量至少達到此張數的股票；1 張 = 1,000 股。",
     )
-    period_label = st.selectbox("歷史資料下載範圍", ["6 個月（建議）", "1 年"], index=0)
-    period = "6mo" if period_label.startswith("6") else "1y"
+    period_label = st.selectbox("歷史資料下載範圍", ["1 個月", "2 個月", "3 個月（建議）"], index=2)
+    # yfinance period values are supported as 1mo/2mo/3mo.
+    period = {"1 個月": "1mo", "2 個月": "2mo", "3 個月（建議）": "3mo"}[period_label]
     volume_unit = st.radio("成交量顯示單位", ["張", "股"], index=0)
     max_stocks = st.selectbox(
         "掃描數量（測試用）",
